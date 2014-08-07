@@ -1,18 +1,25 @@
-var http = require("http"),
+var http = require('http'),
     fs = require("fs"),
+    util = require('util'),
     conf = require('nconf'),   
     express = require('express'),
+    request = require('request'),
     app = express(),
     webserver = http.createServer(app);
 
 var users = {},
-    lookupqueue = [];
+    lastLookup = Date.now(),
+    sentLowNotice = false,
+    pauseUntil = 0;
 
-var CACHE_FILENAME = "users_cache.json";
+var CACHE_FILENAME = "users_cache.json",
+   url = 'https://api.github.com/users/',
+   userAgent = 'github.com/arscan/github-timeline-stream';
+
   
-conf.argv().file({file: __dirname + "/config.json"}).defaults({
-    'api_token': 'xxx',
-    'port': '8080'
+conf.env().argv().file({file: __dirname + "/config.json"}).defaults({
+    'GITHUB_API_WAIT_FOR': 5000,
+    'GITHUB_PORT': '8080'
 });
 
 if(fs.existsSync(__dirname + "/" + CACHE_FILENAME)){
@@ -21,110 +28,86 @@ if(fs.existsSync(__dirname + "/" + CACHE_FILENAME)){
 
 app.get("/:user", function(req,res){
 
-    res.send("{}");
-    /*
-    var lookedup = lookup(req.params.location); 
-    console.log("hit location: " + req.params.location);
-    if(!lookedup){
+
+    /* check to see if the user is in the cache */
+
+    if(users[req.params.user]){
+        console.log("Cache Hit");
+        res.send(JSON.stringify(users[req.params.user]));
+        return;
+    }
+
+    /* not in the cache, see if I can make the call yet */
+
+    if(Date.now() - parseInt(conf.get("GITHUB_API_WAIT_FOR"),10) > lastLookup) {
+        callApi(req.params.user, res);
+        lastLookup = Date.now();
+    } else {
         res.send("{}");
-    } else {
-        res.send(JSON.stringify(lookedup));
+        console.log("too soon");
     }
-   */
-});
-
-app.listen(conf.get('port'));
-
-/*
-var bySortedValue = function(obj, callback, context) {
-    //http://stackoverflow.com/questions/5199901/how-to-sort-an-associative-array-by-its-values-in-javascript
-    var tuples = [];
-
-    for (var key in obj){ tuples.push([key, obj[key]]) };
-
-    tuples.sort(function(b, a) { return a[1].count < b[1].count ? 1 : a[1].count > b[1].count ? -1 : 0 });
-
-    var length = tuples.length;
-    while (length--) callback.call(context, tuples[length][0], tuples[length][1]);
-}
-
-bySortedValue(locations , function(key, value) {
-    if(!value.latlng && !value.fail){
-        lookupqueue.push(key);
-    } 
 });
 
 
-var undefinedcount = 0;
-var reallocationcount = 0;
-var latlongcount = 0;
+function callApi(user, res){
+    var requestOpts = {};
 
-
-var lookup = function(place){
-    if("" + place == "undefined")
-        return undefined;
-
-    if(!locations[place]){
-        locations[place] = {count: 1};
-        lookupqueue.push(place);
-    } else {
-        locations[place].count++;
+    if(Date.now() < pauseUntil){
+        res.send({message: "Over limit"});
+        return;
     }
-    return locations[place]["latlng"];
-}
-var checklocation = function(loc, cb){
 
-    http.get("http://api.geonames.org/searchJSON?maxRows=1&username=" + conf.get("geonames_user") + "&q=" + encodeURIComponent(loc), function(res){
-        var buffer = "";
-        res.on("error", function(){
-            console.log("error looking up geonames");
-        });
-        res.on("data", function(data){buffer=buffer+data});
-        res.on("end",function(){
-            r = JSON.parse(buffer);
-            if(r.geonames && r.geonames[0] && r.geonames[0].lng && r.geonames[0].lat){
-                console.log("" + r.geonames[0].lat + " " +r.geonames[0].lng);
-                cb({"lat":r.geonames[0].lat, "lng": r.geonames[0].lng});
-            } else {
-                cb();
-            }
-            });
-        });
-}
+    requestOpts.url = url + user;
+    requestOpts.headers = {
+        "User-Agent": userAgent,
+        "Accept": "application/vnd.github.v3+json"
+    };
 
-var locationloop = function(){
-    if(lookupqueue.length > 0){
-        l = lookupqueue.shift();
-        console.log("~~~~~~ GETTING "  + l);
-        checklocation(l, function(latlng){
-            if(latlng){
-                locations[l].latlng = latlng;
-            } else {
-                locations[l].fail=1;
-            }
-        });
+    if(conf.get('GITHUB_TOKEN') !== undefined){
+        requestOpts.auth = {
+            user: conf.get('GITHUB_TOKEN'),
+            pass: "x-oauth-basic",
+            sendImmediately: true
+        }
+
+    } else if(conf.get('GITHUB_USERNAME') !== undefined && conf.get('GITHUB_PASSWORD') !== undefined){
+        requestOpts.auth = {
+            user: conf.get('GITHUB_USERNAME'),
+            pass: conf.get('GITHUB_PASSWORD'),
+            sendImmediately: true
+        }
     }
-}
-var savelocationsloop = function(){
-    fs.writeFile(__dirname + '/locations_cache.json', JSON.stringify(locations), function(){
-        console.log("_____saved locations");
-        
-        
+
+    request(requestOpts,function(error, response, body){
+
+        var rateRemaining = parseInt(response.headers['x-ratelimit-remaining'], 10),
+        rateReset = parseInt(response.headers['x-ratelimit-reset'], 10);
+
+        if(rateRemaining <= 60 ){
+            if(!sentLowNotice){
+                console.log("Github-timeline-stream: You have only " + rateRemaining + " requests remaining, you probably should authenticate.  See Readme");
+                sentLowNotice = true;
+            }
+        } 
+
+        if (rateRemaining < 1){
+            console.log("Github-timeline-stream: You have exhausted your requests.  Consider authenticating");
+            pauseUntil = parseInt(response.headers['x-ratelimit-reset'], 10);
+        }
+
+        users[user] = JSON.parse(body);
+    
+        res.send(body);
+
     });
 }
 
-app.get("/:location", function(req,res){
-    var lookedup = lookup(req.params.location); 
-    console.log("hit location: " + req.params.location);
-    if(!lookedup){
-        res.send("{}");
-    } else {
-        res.send(JSON.stringify(lookedup));
-    }
-});
+function saveUsers(){
+    fs.writeFile(__dirname + '/' + CACHE_FILENAME, JSON.stringify(users), function(){
+        console.log("_____saved users");
+    });
+}
 
-setInterval(locationloop,10000);
-setInterval(savelocationsloop,600000);
-app.listen(8080);
-console.log("started");
-*/
+setInterval(saveUsers, 60000);
+
+app.listen(conf.get('GITHUB_PORT'));
