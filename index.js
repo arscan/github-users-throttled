@@ -26,7 +26,7 @@ if(fs.existsSync(__dirname + "/" + CACHE_FILENAME)){
     users = JSON.parse(fs.readFileSync(__dirname + "/" + CACHE_FILENAME, 'utf8'));
 }
 
-app.get("/:user", function(req,res){
+app.get("/users/:user", function(req,res){
 
 
     /* check to see if the user is in the cache */
